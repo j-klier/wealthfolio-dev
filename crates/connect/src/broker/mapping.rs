@@ -115,8 +115,12 @@ fn normalize_source_system(value: Option<&str>) -> Option<String> {
 /// Build metadata JSON for storing in the activity record.
 ///
 /// Extracts relevant fields from the API metadata and formats them for storage.
-pub fn build_activity_metadata(activity: &AccountUniversalActivity) -> Option<String> {
+pub fn build_activity_metadata(
+    activity: &AccountUniversalActivity,
+    cusip_fallback_symbol: Option<&str>,
+) -> Option<String> {
     let mut metadata = serde_json::Map::new();
+    let mut mapping_reasons: Vec<String> = Vec::new();
 
     // Preserve an explicit performance-boundary classification from the provider.
     if let Some(ref mapping_meta) = activity.mapping_metadata {
@@ -137,12 +141,20 @@ pub fn build_activity_metadata(activity: &AccountUniversalActivity) -> Option<St
         }
 
         // Add mapping reasons (for debugging/review)
-        if !mapping_meta.reasons.is_empty() {
-            metadata.insert(
-                "mapping_reasons".to_string(),
-                serde_json::json!(mapping_meta.reasons),
-            );
-        }
+        mapping_reasons.extend(mapping_meta.reasons.iter().cloned());
+    }
+
+    if let Some(symbol) = cusip_fallback_symbol {
+        mapping_reasons.push(format!(
+            "Symbol {symbol} was imported as a bond because it lacks a symbol_type_code."
+        ));
+    }
+
+    if !mapping_reasons.is_empty() {
+        metadata.insert(
+            "mapping_reasons".to_string(),
+            serde_json::json!(mapping_reasons),
+        );
     }
 
     // Add raw_type from provider
@@ -377,6 +389,48 @@ pub fn normalize_broker_symbol(
     })
 }
 
+fn cusip_char_value(ch: char) -> Option<u32> {
+    if let Some(digit) = ch.to_digit(10) {
+        return Some(digit);
+    }
+    if ch.is_ascii_alphabetic() {
+        return Some(ch.to_ascii_uppercase() as u32 - 'A' as u32 + 10);
+    }
+    match ch {
+        '*' => Some(36),
+        '@' => Some(37),
+        '#' => Some(38),
+        _ => None,
+    }
+}
+
+/// Validates a 9-character CUSIP via its standard check-digit algorithm.
+/// Used as a fallback bond signal when the broker sends no symbol type at
+/// all (observed for Treasury securities synced via SnapTrade/Akoya from
+/// some institutions, e.g. Edward Jones), so trade amounts don't get
+/// silently corrupted by treating a percent-of-par bond price as a literal
+/// per-unit dollar price.
+fn is_valid_cusip(symbol: &str) -> bool {
+    let chars: Vec<char> = symbol.chars().collect();
+    if chars.len() != 9 {
+        return false;
+    }
+    let Some(check_digit) = chars[8].to_digit(10) else {
+        return false;
+    };
+    let mut total: u32 = 0;
+    for (i, &ch) in chars[..8].iter().enumerate() {
+        let Some(mut value) = cusip_char_value(ch) else {
+            return false;
+        };
+        if i % 2 == 1 {
+            value *= 2;
+        }
+        total += value / 10 + value % 10;
+    }
+    (10 - (total % 10)) % 10 == check_digit
+}
+
 fn normalized_trade_amount(
     activity_type: &str,
     quantity: Option<Decimal>,
@@ -448,11 +502,29 @@ pub fn map_broker_activity(
     let subtype =
         NewActivity::canonicalize_subtype_for_activity(&activity_type, subtype.as_deref());
 
+    // Extract symbol reference for convenience
+    let symbol_ref = activity.symbol.as_ref();
+    let symbol_type_ref = symbol_ref.and_then(|s| s.symbol_type.as_ref());
+    let symbol_type_code = symbol_type_ref.and_then(|t| t.code.as_deref());
+    let is_crypto = is_broker_crypto(symbol_type_code);
+    // When the broker gives no symbol type at all, fall back to a CUSIP
+    // check-digit match as a bond signal (see is_valid_cusip's docs). This is
+    // a heuristic, not a certainty, so track which symbol triggered it and
+    // flag the activity for review rather than trusting it silently.
+    let cusip_fallback_symbol = if symbol_type_code.map(str::trim).unwrap_or("").is_empty() {
+        symbol_ref
+            .and_then(|s| s.raw_symbol.as_deref().or(s.symbol.as_deref()))
+            .filter(|sym| is_valid_cusip(sym))
+    } else {
+        None
+    };
+    let is_bond = is_broker_bond(symbol_type_code) || cusip_fallback_symbol.is_some();
+
     // Calculate needs_review flag
-    let needs_review_flag = needs_review(activity);
+    let needs_review_flag = needs_review(activity) || cusip_fallback_symbol.is_some();
 
     // Build metadata JSON
-    let metadata = build_activity_metadata(activity);
+    let metadata = build_activity_metadata(activity, cusip_fallback_symbol);
 
     let is_never_asset_type = activities::NEVER_ASSET_TYPES.contains(&activity_type.as_str());
 
@@ -467,13 +539,6 @@ pub fn map_broker_activity(
             | activities::ACTIVITY_TYPE_TRANSFER_OUT
             | activities::ACTIVITY_TYPE_CREDIT
     );
-
-    // Extract symbol reference for convenience
-    let symbol_ref = activity.symbol.as_ref();
-    let symbol_type_ref = symbol_ref.and_then(|s| s.symbol_type.as_ref());
-    let symbol_type_code = symbol_type_ref.and_then(|t| t.code.as_deref());
-    let is_crypto = is_broker_crypto(symbol_type_code);
-    let is_bond = is_broker_bond(symbol_type_code);
 
     // Ticker and venue come from the same normalization the holdings path uses, so
     // one instrument cannot land under two asset identities depending on which
@@ -809,6 +874,41 @@ mod tests {
         assert_eq!(mapped.amount.unwrap().round_dp(4), decimal("997.6000"));
         assert_eq!(mapped.fee.unwrap().round_dp(4), decimal("4.9000"));
         assert_eq!(mapped.tax, None);
+    }
+
+    #[test]
+    fn test_map_broker_activity_detects_bond_via_cusip_when_type_code_missing() {
+        // Some institutions send no symbol_type_code at all for fixed-income
+        // securities. Without a CUSIP fallback, this would be treated as a
+        // plain equity trade and its percent-of-par bond price would get
+        // multiplied straight into the amount. "TESTBND00" is a synthetic
+        // symbol built to pass the CUSIP check digit -- not a real security.
+        let activity = AccountUniversalActivity {
+            id: Some("act-bond-buy".to_string()),
+            activity_type: Some("BUY".to_string()),
+            symbol: Some(broker_symbol("TESTBND00", "")),
+            units: Some(1000.0),
+            price: Some(95.5),
+            amount: Some(955.0),
+            ..Default::default()
+        };
+
+        let mapped = map_test_activity(&activity);
+
+        let asset = mapped.asset.expect("bond activity should produce an asset");
+        assert_eq!(asset.kind.as_deref(), Some("BOND"));
+        assert_eq!(asset.instrument_type.as_deref(), Some("BOND"));
+        assert_eq!(mapped.amount.unwrap().round_dp(2), decimal("955.00"));
+
+        // The CUSIP fallback is a heuristic, not a certainty -- flag it for
+        // review rather than trusting it silently.
+        assert_eq!(mapped.needs_review, Some(true));
+        let metadata: serde_json::Value =
+            serde_json::from_str(mapped.metadata.as_deref().expect("metadata")).unwrap();
+        assert_eq!(
+            metadata["mapping_reasons"][0],
+            "Symbol TESTBND00 was imported as a bond because it lacks a symbol_type_code."
+        );
     }
 
     #[test]
